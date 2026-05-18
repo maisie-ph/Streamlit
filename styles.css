@@ -1,0 +1,76 @@
+
+[data-testid="stSidebar"] {
+    background-color: #08A045 !important;
+}
+
+[data-testid="stSidebar"] * {
+    color: white !important;
+    font-size: 22px !important;
+    font-weight: bold;
+}
+
+[data-testid="stSidebar"] .st-bn {
+    color: white !important;
+    font-size: 60px !important;
+    
+}
+
+[data-testid="stSidebar"] a {
+    font-size: 60px !important;
+    color: white !important;
+}
+
+[data-testid="stSidebar"] .st-bw {
+    background-color: #3a5f8a !important;
+}
+
+
+/* Main content layout */
+.block-container {
+    padding-top: 3rem !important;
+    padding-left: 3rem !important;  
+    padding-right: 3rem !important; 
+}
+
+/* Column spacing */
+/* [data-testid="column"] {
+    padding-left: 0.75rem !important;
+    padding-right: 0.75rem !important;
+} */
+
+/* Element spacing */
+/* .stMetric {
+    margin-bottom: 1rem !important;  
+}
+
+.stTable {
+    margin-bottom: 1.5rem !important; 
+}
+
+.stSpinner {
+    margin-bottom: 1rem !important;
+} */
+
+/* Horizontal block spacing */
+/* [data-testid="stHorizontalBlock"] {
+    width: 100% !important;
+    padding-left: 0 !important;
+    padding-right: 0 !important;
+} */
+
+/* Make columns stretch to full width */
+/* [data-testid="stHorizontalBlock"] > div {
+    width: 100% !important;
+} */
+
+/* Add some space between main sections */
+/* .stSubheader {
+    margin-top: 1.5rem !important;
+    margin-bottom: 1rem !important;
+} */
+
+/* Button spacing */
+/* .stButton > button {
+    margin-top: 1rem !important;
+    margin-bottom: 1rem !important;
+} */

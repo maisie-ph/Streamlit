@@ -1,0 +1,5 @@
+{
+    "DATA_PATH": "/Users/maisie/Downloads/Streamlit/sample_data",
+    "MAX_EDGES_DISPLAY": 5000,
+    "FILE_NAME": "Account_New_cleaned_data_enriched_w_lists_w_hubs_w_communities.parquet"
+}
