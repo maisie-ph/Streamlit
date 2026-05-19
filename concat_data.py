@@ -37,27 +37,26 @@ CSV_OPTIONS = dict(
 )
 
 
-def keyword_filter(df: pl.DataFrame, columns: list[str], keywords: list[str]) -> pl.DataFrame:
-    """Keep rows where any of the given columns exactly matches any keyword."""
+def build_keyword_mask(columns: list[str], keywords: list[str]) -> pl.Expr:
+    """Build a lazy filter expression — applied before collect() to avoid loading all rows."""
     kw_set = [kw.lower() for kw in keywords]
     mask = pl.lit(False)
     for col in columns:
         mask = mask | pl.col(col).cast(pl.Utf8).str.to_lowercase().is_in(kw_set)
-    return df.filter(mask)
+    return mask
 
 
 def main() -> None:
     all_files = [FILE_2025] + FILES_2026
 
+    mask = build_keyword_mask(COLUMNS_TO_SCREEN, KEYWORDS)
+
     frames = [
-        pl.scan_csv(f, **CSV_OPTIONS).select(COLUMNS_TO_KEEP)
+        pl.scan_csv(f, **CSV_OPTIONS).select(COLUMNS_TO_KEEP).filter(mask)
         for f in all_files
     ]
 
     df = pl.concat(frames, how="diagonal_relaxed").collect(streaming=True)
-    print(f"Total rows before filter : {df.height:,}")
-
-    df = keyword_filter(df, COLUMNS_TO_SCREEN, KEYWORDS)
     print(f"Total rows after filter  : {df.height:,}")
     print(df.head(5))
 
