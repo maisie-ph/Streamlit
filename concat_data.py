@@ -1,69 +1,37 @@
-import polars as pl
 from pathlib import Path
+import pandas as pd
+import yaml
 
-FILE_2025 = Path("")
-
-FILES_2026 = [
-    Path(""),
-    Path(""),
-    Path(""),
-]
-
-COLUMNS_TO_KEEP = [
-    "",
-    "",
-    "",
-]
-
-# Columns to search for keywords (must be a subset of COLUMNS_TO_KEEP)
-COLUMNS_TO_SCREEN = [
-    "",
-    "",
-]
-
-# Exact-match keywords (case-insensitive)
-KEYWORDS = [
-    "",
-    "",
-]
-
-OUTPUT_FILE = Path("")
-
-CSV_OPTIONS = dict(
-    separator=",",
-    infer_schema_length=10_000,
-    try_parse_dates=True,
-    truncate_ragged_lines=True,
-)
+AUDIT_PATH = Path("/mnt/PDQ_US/audit")
+FILES = {
+    "strata": "{}_strata_audit_PDQ.csv",
+    "combos": "{}_combos_audit_PDQ.csv",
+    "representation": "{}_representation_audit_PDQ.csv",
+}
+FLAGS = ["hs_ctpy", "digital_asset_mess_name", "msb_fcl_hit"]
 
 
-def build_keyword_mask(columns: list[str], keywords: list[str]) -> pl.Expr:
-    """Build a lazy filter expression — applied before collect() to avoid loading all rows."""
-    kw_set = [kw.lower() for kw in keywords]
-    mask = pl.lit(False)
-    for col in columns:
-        mask = mask | pl.col(col).cast(pl.Utf8).str.to_lowercase().is_in(kw_set)
-    return mask
+def load_config(cfg_path):
+    with Path(cfg_path).open() as f:
+        return yaml.safe_load(f)
 
 
-def main() -> None:
-    all_files = [FILE_2025] + FILES_2026
+def load_audit_data(prefix, audit_path=AUDIT_PATH):
+    return {k: pd.read_csv(audit_path / t.format(prefix)) for k, t in FILES.items()}
 
-    mask = build_keyword_mask(COLUMNS_TO_SCREEN, KEYWORDS)
 
-    frames = [
-        pl.scan_csv(f, **CSV_OPTIONS).select(COLUMNS_TO_KEEP).filter(mask)
-        for f in all_files
-    ]
+def filter_undersampled(combos, flag, full_pct=100):
+    mask = combos["stratum_flags"].fillna("").str.contains(flag, regex=False)
+    return combos[mask & (combos["sample_pct"] != full_pct)]
 
-    df = pl.concat(frames, how="diagonal_relaxed").collect(streaming=True)
-    print(f"Total rows after filter  : {df.height:,}")
-    print(df.head(5))
 
-    OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
-    df.write_parquet(OUTPUT_FILE, compression="zstd")
-    print(f"Saved → {OUTPUT_FILE}")
+def audit_flags(combos, flags=FLAGS):
+    return {f: filter_undersampled(combos, f).stratum_flags.unique() for f in flags}
 
 
 if __name__ == "__main__":
-    main()
+    cfg = load_config("US_3_sampling_config.yml")
+    data = load_audit_data(f"{cfg['period']}_{cfg['country']}")
+    for flag, combos in audit_flags(data["combos"]).items():
+        print(f"\n=== {flag} ===")
+        print("\n".join(f"  - {c}" for c in combos) or "  fully sampled")
