@@ -24,6 +24,39 @@ def build_entity_community_frame(partition: dict) -> pl.DataFrame:
         "community_index": list(partition.values()),
     }).with_columns(pl.col("community_index").cast(pl.Int32))
 
+#STEP 1.2 entity account to entity name
+#===================================================
+import polars as pl
+from collections import defaultdict
+
+def build_account_to_names(transactions_path: str,
+                             orig_acc_col: str, orig_name_col: str,
+                             bene_acc_col: str, bene_name_col: str) -> dict:
+    lf = pl.scan_parquet(transactions_path)
+
+    orig_pairs = lf.select(
+        pl.col(orig_acc_col).alias("account"),
+        pl.col(orig_name_col).alias("name")
+    )
+    bene_pairs = lf.select(
+        pl.col(bene_acc_col).alias("account"),
+        pl.col(bene_name_col).alias("name")
+    )
+
+    all_pairs = (
+        pl.concat([orig_pairs, bene_pairs])
+        .drop_nulls()
+        .unique()  # dedupe identical (account, name) rows before grouping
+        .collect()
+    )
+
+    account_to_names = defaultdict(set)
+    for account, name in zip(all_pairs["account"].to_list(), all_pairs["name"].to_list()):
+        account_to_names[account].add(name)
+
+    return dict(account_to_names)
+
+
 
 # ============================================================
 # STEP 2 — regulator's boundary-safe patterns
