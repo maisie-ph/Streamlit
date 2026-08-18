@@ -1,0 +1,396 @@
+# /// script
+# dependencies = [
+#   "polars",
+#   "networkx",
+# ]
+# ///
+"""
+Suspicious entity screening pipeline (Network project)
+--------------------------------------------------------
+SECTION 1 below contains the original pipeline functions, unchanged.
+SECTION 2 adds audit-trail export and per-transaction suspicious-name
+linkage on top, without modifying anything in SECTION 1.
+"""
+
+import re
+import time
+import pickle
+from collections import defaultdict
+
+import polars as pl
+import networkx as nx
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+GRAPH_PATH = "network_graph.pkl"             # pickled nx.Graph (undirected), nodes = account numbers
+PARTITION_PATH = "partition.pkl"             # pickled dict {account_number: community_index}
+SUSPICIOUS_PATH = "suspicious_entities.txt"  # one suspicious name per line
+TRANSACTIONS_PATH = "transactions.parquet"
+
+ORIG_ACC_COL = "orig_account_number"
+ORIG_NAME_COL = "orig_name"
+BENE_ACC_COL = "bene_account_number"
+BENE_NAME_COL = "bene_name"
+MESSAGE_KEY_COL = "message_key"
+
+HOPS = 3
+
+FLAGGED_TRANSACTIONS_OUTPUT = "flagged_transactions.parquet"
+AUDIT_TRAIL_OUTPUT = "audit_trail.parquet"
+ANNOTATED_TRANSACTIONS_OUTPUT = "flagged_transactions_annotated.parquet"
+
+
+# ============================================================
+# LOADERS
+# ============================================================
+def load_graph_and_partition(graph_path: str, partition_path: str):
+    with open(graph_path, "rb") as f:
+        G = pickle.load(f)
+    with open(partition_path, "rb") as f:
+        partition = pickle.load(f)
+    return G, partition
+
+
+def load_suspicious_entities(path: str) -> list[str]:
+    with open(path) as f:
+        return [line.strip() for line in f if line.strip()]
+
+
+# ============================================================
+# SECTION 1 — ORIGINAL PIPELINE (unchanged)
+# ============================================================
+
+# --- account <-> name mapping (one account, many name variants) ---
+def build_account_to_names(transactions_path: str,
+                            orig_acc_col: str, orig_name_col: str,
+                            bene_acc_col: str, bene_name_col: str) -> dict:
+    lf = pl.scan_parquet(transactions_path)
+
+    orig_pairs = lf.select(
+        pl.col(orig_acc_col).alias("account"),
+        pl.col(orig_name_col).alias("name"),
+    )
+    bene_pairs = lf.select(
+        pl.col(bene_acc_col).alias("account"),
+        pl.col(bene_name_col).alias("name"),
+    )
+
+    all_pairs = (
+        pl.concat([orig_pairs, bene_pairs])
+        .drop_nulls()
+        .unique()
+        .collect()
+    )
+
+    account_to_names = defaultdict(set)
+    for account, name in zip(all_pairs["account"].to_list(), all_pairs["name"].to_list()):
+        account_to_names[account].add(name)
+
+    return dict(account_to_names)
+
+
+# --- regulator's boundary-safe matching patterns (exact logic) ---
+def build_scenario_patterns(keyword_list: list[str]) -> dict[int, re.Pattern]:
+    alt = "|".join(map(re.escape, keyword_list))
+    return {
+        1: re.compile(rf"^({alt})(?=[^A-Za-z])", re.IGNORECASE),
+        2: re.compile(rf"(?<=[^A-Za-z])({alt})(?=[^A-Za-z])", re.IGNORECASE),
+        3: re.compile(rf"(?<=[^A-Za-z])({alt})$", re.IGNORECASE),
+        4: re.compile(rf"^({alt})$", re.IGNORECASE),
+    }
+
+
+def match_scenarios_with_details(text, patterns: dict[int, re.Pattern]):
+    if text is None:
+        return [], []
+    text = str(text)
+    matches = set()
+    scenarios_used = []
+    for scenario_num, pattern in patterns.items():
+        found = pattern.findall(text)
+        if found:
+            matches.update(found)
+            scenarios_used.extend([scenario_num] * len(found))
+    return list(matches), scenarios_used
+
+
+# --- coarse filter (vectorized) -> exact match -> confirmed accounts ---
+def find_confirmed_suspicious_accounts(account_to_names: dict,
+                                        suspicious: list[str],
+                                        patterns: dict) -> set:
+    accounts, names = [], []
+    for account, name_set in account_to_names.items():
+        for name in name_set:
+            accounts.append(account)
+            names.append(name)
+
+    flat_df = pl.DataFrame({"account": accounts, "name": names})
+
+    coarse_pattern = r"(?i)\b(?:" + "|".join(re.escape(e) for e in suspicious) + r")\b"
+    candidates = flat_df.filter(pl.col("name").str.contains(coarse_pattern))
+
+    confirmed_accounts = set()
+    for account, name in zip(candidates["account"].to_list(), candidates["name"].to_list()):
+        matches, _ = match_scenarios_with_details(name, patterns)
+        if matches:
+            confirmed_accounts.add(account)
+
+    return confirmed_accounts
+
+
+# --- community pre-filter (cheap: only touches confirmed accounts) ---
+def get_flagged_community_ids(partition: dict, confirmed_accounts: set):
+    flagged = set()
+    suspects_by_community = defaultdict(list)
+    for account in confirmed_accounts:
+        comm = partition.get(account)
+        if comm is not None:
+            flagged.add(comm)
+            suspects_by_community[comm].append(account)
+    return flagged, suspects_by_community
+
+
+def build_entity_community_frame(partition: dict) -> pl.DataFrame:
+    return pl.DataFrame({
+        "account": list(partition.keys()),
+        "community_index": list(partition.values()),
+    }).with_columns(pl.col("community_index").cast(pl.Int32))
+
+
+def build_filtered_community_entities(entities_df: pl.DataFrame, flagged_community_ids: set) -> dict:
+    filtered = entities_df.filter(pl.col("community_index").is_in(flagged_community_ids))
+    community_to_entities = defaultdict(list)
+    for account, comm in zip(filtered["account"].to_list(), filtered["community_index"].to_list()):
+        community_to_entities[comm].append(account)
+    return community_to_entities
+
+
+# --- undirected N-hop traversal ---
+def get_hop_limited_entities(G, suspects_by_community, community_to_entities, hops: int = 3) -> set:
+    flagged_entities = set()
+
+    for comm_id, suspects in suspects_by_community.items():
+        nodes_in_community = community_to_entities.get(comm_id, [])
+        if not nodes_in_community:
+            continue
+
+        subgraph = G.subgraph(nodes_in_community)  # nx.Graph -> already undirected
+
+        for suspect in suspects:
+            if suspect not in subgraph:
+                continue
+            ego = nx.ego_graph(subgraph, suspect, radius=hops)
+            flagged_entities.update(ego.nodes())
+
+    return flagged_entities
+
+
+# --- filter the 5M-row transaction dataset ---
+def filter_transactions(hop_entities: set, transactions_path: str, output_path: str,
+                         orig_acc_col: str, bene_acc_col: str, message_key_col: str):
+    hop_df = pl.DataFrame({"account": list(hop_entities)})
+    lf = pl.scan_parquet(transactions_path)
+
+    orig_hits = lf.join(hop_df.lazy(), left_on=orig_acc_col, right_on="account", how="semi")
+    bene_hits = lf.join(hop_df.lazy(), left_on=bene_acc_col, right_on="account", how="semi")
+
+    result = pl.concat([orig_hits, bene_hits]).unique(subset=[message_key_col])
+    result.collect().write_parquet(output_path)
+
+
+# ============================================================
+# SECTION 2 — ADDITIVE FEATURES (nothing above this is modified)
+# ============================================================
+
+# --- Feature 1: audit trail export ---
+def build_audit_trail(account_to_names: dict, suspicious: list[str],
+                       patterns: dict, partition: dict) -> pl.DataFrame:
+    """
+    Re-derives the same confirmed hits as find_confirmed_suspicious_accounts(),
+    but keeps which suspicious term matched which name string, plus community.
+    Standalone - does not call or alter the original function.
+    """
+    rows = []
+    for account, name_set in account_to_names.items():
+        for name in name_set:
+            matched_terms, _ = match_scenarios_with_details(name, patterns)
+            for term in matched_terms:
+                rows.append({
+                    "suspicious_name": term,
+                    "matched_entity_name": name,
+                    "account_number": account,
+                    "community_index": partition.get(account),
+                })
+
+    if not rows:
+        return pl.DataFrame({
+            "suspicious_name": [], "matched_entity_name": [],
+            "account_number": [], "community_index": [],
+        })
+    return pl.DataFrame(rows)
+
+
+# --- Feature 2: per-transaction suspicious-name linkage ---
+def build_account_to_suspicious_names(audit_trail: pl.DataFrame) -> dict:
+    mapping = defaultdict(set)
+    for acc, term in zip(audit_trail["account_number"].to_list(), audit_trail["suspicious_name"].to_list()):
+        mapping[acc].add(term)
+    return dict(mapping)
+
+
+def get_hop_reached_names(G, suspects_by_community, community_to_entities,
+                           account_to_suspicious_names: dict, hops: int = 3) -> dict:
+    """
+    Mirrors get_hop_limited_entities()'s traversal, but tracks which
+    suspicious name(s) reached each entity instead of just the entity set.
+    """
+    reached_entity_to_names = defaultdict(set)
+
+    for comm_id, suspects in suspects_by_community.items():
+        nodes_in_community = community_to_entities.get(comm_id, [])
+        if not nodes_in_community:
+            continue
+
+        subgraph = G.subgraph(nodes_in_community)
+
+        for suspect in suspects:
+            if suspect not in subgraph:
+                continue
+            ego = nx.ego_graph(subgraph, suspect, radius=hops)
+            names_for_suspect = account_to_suspicious_names.get(suspect, set())
+
+            for reached_account in ego.nodes():
+                reached_entity_to_names[reached_account].update(names_for_suspect)
+
+    return reached_entity_to_names
+
+
+def annotate_transactions_with_names(flagged_transactions_path: str,
+                                      reached_entity_to_names: dict,
+                                      output_path: str,
+                                      orig_acc_col: str, bene_acc_col: str,
+                                      message_key_col: str):
+    """
+    Adds a linked_suspicious_names column to the output that
+    filter_transactions() already produced.
+    """
+    hop_accounts = list(reached_entity_to_names.keys())
+    hop_df = pl.DataFrame({
+        "account": hop_accounts,
+        "linked_names_orig": [list(reached_entity_to_names[a]) for a in hop_accounts],
+    })
+    hop_df_bene = hop_df.rename({"linked_names_orig": "linked_names_bene"})
+
+    lf = pl.scan_parquet(flagged_transactions_path)
+
+    with_orig = lf.join(hop_df.lazy(), left_on=orig_acc_col, right_on="account", how="left")
+    with_both = with_orig.join(hop_df_bene.lazy(), left_on=bene_acc_col, right_on="account", how="left")
+
+    result = (
+        with_both.with_columns(
+            pl.concat_list([
+                pl.col("linked_names_orig").fill_null([]),
+                pl.col("linked_names_bene").fill_null([]),
+            ]).list.unique().alias("linked_suspicious_names")
+        )
+        .drop(["linked_names_orig", "linked_names_bene"])
+        .unique(subset=[message_key_col])
+    )
+
+    result.collect().write_parquet(output_path)
+
+
+# ============================================================
+# PIPELINE
+# ============================================================
+def run_screening_pipeline(G, partition, suspicious_entities: list[str],
+                            transactions_path: str,
+                            orig_acc_col: str, orig_name_col: str,
+                            bene_acc_col: str, bene_name_col: str,
+                            message_key_col: str,
+                            hops: int,
+                            flagged_transactions_output: str,
+                            audit_trail_output: str,
+                            annotated_transactions_output: str):
+    t0 = time.time()
+
+    # --- Section 1: original pipeline, unchanged ---
+    account_to_names = build_account_to_names(
+        transactions_path, orig_acc_col, orig_name_col, bene_acc_col, bene_name_col
+    )
+    print(f"[1/8] account -> names mapping: {len(account_to_names):,} accounts ({time.time()-t0:.1f}s)")
+
+    patterns = build_scenario_patterns(suspicious_entities)
+
+    t1 = time.time()
+    confirmed_accounts = find_confirmed_suspicious_accounts(account_to_names, suspicious_entities, patterns)
+    print(f"[2/8] confirmed suspicious accounts: {len(confirmed_accounts):,} ({time.time()-t1:.1f}s)")
+
+    t2 = time.time()
+    flagged_community_ids, suspects_by_community = get_flagged_community_ids(partition, confirmed_accounts)
+    print(f"[3/8] flagged communities: {len(flagged_community_ids):,} ({time.time()-t2:.1f}s)")
+
+    t3 = time.time()
+    entities_df = build_entity_community_frame(partition)
+    community_to_entities = build_filtered_community_entities(entities_df, flagged_community_ids)
+    n_entities_in_scope = sum(len(v) for v in community_to_entities.values())
+    print(f"[4/8] entities bucketed (flagged communities only): {n_entities_in_scope:,} "
+          f"({time.time()-t3:.1f}s)")
+
+    t4 = time.time()
+    hop_entities = get_hop_limited_entities(G, suspects_by_community, community_to_entities, hops=hops)
+    print(f"[5/8] {hops}-hop neighborhood: {len(hop_entities):,} entities ({time.time()-t4:.1f}s)")
+
+    t5 = time.time()
+    filter_transactions(
+        hop_entities, transactions_path, flagged_transactions_output,
+        orig_acc_col, bene_acc_col, message_key_col
+    )
+    print(f"[6/8] transactions filtered -> {flagged_transactions_output} ({time.time()-t5:.1f}s)")
+
+    # --- Section 2: additive features ---
+    t6 = time.time()
+    audit_trail = build_audit_trail(account_to_names, suspicious_entities, patterns, partition)
+    audit_trail.write_parquet(audit_trail_output)
+    print(f"[7/8] audit trail: {audit_trail.height:,} rows -> {audit_trail_output} "
+          f"({time.time()-t6:.1f}s)")
+
+    t7 = time.time()
+    account_to_suspicious_names = build_account_to_suspicious_names(audit_trail)
+    reached_entity_to_names = get_hop_reached_names(
+        G, suspects_by_community, community_to_entities, account_to_suspicious_names, hops=hops
+    )
+    annotate_transactions_with_names(
+        flagged_transactions_output, reached_entity_to_names, annotated_transactions_output,
+        orig_acc_col, bene_acc_col, message_key_col
+    )
+    print(f"[8/8] transactions annotated -> {annotated_transactions_output} ({time.time()-t7:.1f}s)")
+
+    print(f"\nTotal pipeline time: {time.time()-t0:.1f}s")
+    return audit_trail, reached_entity_to_names
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+if __name__ == "__main__":
+    G, PARTITION = load_graph_and_partition(GRAPH_PATH, PARTITION_PATH)
+    SUSPICIOUS_ENTITIES = load_suspicious_entities(SUSPICIOUS_PATH)
+
+    audit_trail, reached_entity_to_names = run_screening_pipeline(
+        G=G,
+        partition=PARTITION,
+        suspicious_entities=SUSPICIOUS_ENTITIES,
+        transactions_path=TRANSACTIONS_PATH,
+        orig_acc_col=ORIG_ACC_COL,
+        orig_name_col=ORIG_NAME_COL,
+        bene_acc_col=BENE_ACC_COL,
+        bene_name_col=BENE_NAME_COL,
+        message_key_col=MESSAGE_KEY_COL,
+        hops=HOPS,
+        flagged_transactions_output=FLAGGED_TRANSACTIONS_OUTPUT,
+        audit_trail_output=AUDIT_TRAIL_OUTPUT,
+        annotated_transactions_output=ANNOTATED_TRANSACTIONS_OUTPUT,
+    )
