@@ -1,0 +1,437 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Sample adjustment loop (stage 3).
+
+Runs the representation check of US_5_representation_check.py and, as long as
+at least one flag fails, tops-up the sample with population pairs and checks
+again - until every flag passes.
+
+Top-up logic (applied to each failing flag)
+-------------------------------------------
+1. Identify all the sub-strata involving the flag for which there are pairs
+   yet to be sampled.
+   (sub-stratum = flag combination x country_risk, i.e. a combination of a
+   stratum of the sampling pipeline)
+2. Rank these sub-strata by decreasing total number of red flags.
+3. Sample the pairs required until the test is passed, starting from the
+   sub-stratum with the highest number of flags. If a sub-stratum is
+   exhausted before the flag passes, move on to the next one.
+4. Tie on the total number of red flags: the sub-stratum is picked randomly.
+   If the pairs needed from that sub-stratum would lead to a relative
+   under-sampling of another flag (a flag that passes now would fail), another
+   sub-stratum is chosen (rest of the tie, then the next lower number of
+   flags). If every candidate under-samples another flag, the least harmful
+   one is used and the next round repairs the other flag(s).
+
+Usage
+-----
+python US_6_adjust_sample.py \
+    --population pairs.csv \
+    --sample sampled_pairs.csv \
+    --config sampling_config.yml \
+    [--max-rounds 20] \
+    [--max-add 1000] \
+    [--seed 911] \
+    [--count-country-risk]
+
+US_5_representation_check.py must be in the same folder as this file.
+
+Outputs (in the `audit` folder used by US_5_representation_check.py)
+-------
+adjusted_sampled_pairs.csv          original sample + added pairs
+                                    (column `adjustment_round`: 0 = original)
+sample_adjustment_log.csv           one row per added pair
+sample_adjustment_steps.csv         one row per sampling decision (flag,
+                                    sub-stratum, ties, rejected sub-strata)
+adjustment_history.csv              one row per round (failing flags, size)
+representation_audit_PDQ_round<k>.csv   audit after k top-up rounds
+representation_audit_PDQ.csv        final audit
+"""
+
+import argparse
+import importlib
+import random
+import sys
+import traceback
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+rep = importlib.import_module("US_5_representation_check")
+
+
+# ---------------------------------------------------------------------
+# 1. Pass / fail rule (same rule as the main loop of US_5)
+# ---------------------------------------------------------------------
+def flag_passes(
+    pop_cnt: int,
+    samp_cnt: int,
+    N_pop: int,
+    N_samp: int,
+    alpha: float,
+    confidence: float,
+    small_sample: int,
+) -> bool:
+    """A flag passes if the one-sided test rejects H0 AND the lower bound of the CI is above p_pop."""
+    pop_prop = pop_cnt / N_pop if N_pop else 0.0
+    samp_prop = samp_cnt / N_samp if N_samp else 0.0
+
+    if pop_cnt < small_sample:
+        test_res = rep.exact_binom_test(pop_prop, samp_cnt, N_samp, pop_cnt, alpha=alpha, alternative="greater")
+    else:
+        test_res = rep.one_sided_z_test(pop_prop, samp_prop, N_samp, pop_cnt, alpha=alpha)
+
+    if pop_cnt > small_sample:
+        ci_res = rep.wilson_ci(samp_prop, N_samp, confidence=confidence)
+    else:
+        ci_res = rep.jeffreys_ci(samp_prop, N_samp, confidence=confidence)
+
+    lb_res = rep.lower_bound_check(pop_prop, ci_res, pop_cnt, samp_cnt)
+    return bool(test_res["reject_H0"]) and bool(lb_res["lower_exceeds_pop"])
+
+
+# ---------------------------------------------------------------------
+# 2. Sub-stratum based top-up
+# ---------------------------------------------------------------------
+class Adjuster:
+    """Keeps the state of the sample (flag counts, size, pairs left to sample) while pairs are added."""
+
+    def __init__(
+        self,
+        pop_df: pd.DataFrame,
+        samp_df: pd.DataFrame,
+        alpha: float,
+        confidence: float,
+        small_sample: int,
+        rng: random.Random,
+        count_country_risk: bool = False,
+    ):
+        self.alpha = alpha
+        self.confidence = confidence
+        self.small_sample = small_sample
+        self.rng = rng
+
+        self.N_pop = len(pop_df)
+        self.flags = rep.extract_all_flags(pop_df, column="canonical")
+        self.pop_cnt = {f: int(rep.flag_mask(pop_df["canonical"], f).sum()) for f in self.flags}
+        self.counts = {f: int(rep.flag_mask(samp_df["canonical"], f).sum()) for f in self.flags}
+        self.N = len(samp_df)
+
+        # Sub-strata = flag combination x country_risk (only those with pairs left to sample)
+        keys = pop_df["canonical"] + "|" + pop_df["country_risk"].astype(str)
+        unsampled = ~pop_df["Pair_ID"].isin(set(samp_df["Pair_ID"]))
+        self.sub: Dict[str, dict] = {}
+        self.pool: Dict[str, list] = {}
+        for key, idx in pop_df[unsampled].groupby(keys[unsampled]).groups.items():
+            canon, country_risk = key.rsplit("|", 1)
+            flags = set(canon.split(","))
+            n_red = len(flags) + (1 if count_country_risk and country_risk == "1" else 0)
+            members = list(idx)
+            self.rng.shuffle(members)              # random draw inside a sub-stratum
+            self.sub[key] = {"flags": flags, "n_red": n_red, "canonical": canon, "country_risk": country_risk}
+            self.pool[key] = members
+
+    # ---- tests ---------------------------------------------------------
+    def _passes_one(self, f: str, samp_cnt: int, N: int) -> bool:
+        return flag_passes(self.pop_cnt[f], samp_cnt, self.N_pop, N,
+                           self.alpha, self.confidence, self.small_sample)
+
+    def passes(self, counts: Dict[str, int], N: int) -> Dict[str, bool]:
+        return {f: self._passes_one(f, counts[f], N) for f in self.flags}
+
+    def min_pairs(self, f: str, key: str) -> Tuple[int, bool]:
+        """Minimum number of pairs of sub-stratum `key` needed for flag f to pass (all of them carry f)."""
+        lo, hi = 0, len(self.pool[key])
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if self._passes_one(f, self.counts[f] + mid, self.N + mid):
+                hi = mid
+            else:
+                lo = mid + 1
+        return lo, self._passes_one(f, self.counts[f] + lo, self.N + lo)
+
+    def newly_failing(self, f: str, key: str, k: int, before: Dict[str, bool]) -> List[str]:
+        """Flags (other than f) that pass now but would fail once k pairs of `key` are added."""
+        in_sub = self.sub[key]["flags"]
+        new_counts = {g: c + (k if g in in_sub else 0) for g, c in self.counts.items()}
+        after = self.passes(new_counts, self.N + k)
+        return [g for g in self.flags if g != f and before[g] and not after[g]]
+
+    # ---- main routine for one flag ------------------------------------
+    def fix_flag(self, f: str, rnd: int, budget: Optional[int]) -> Tuple[List[dict], List[int]]:
+        steps: List[dict] = []
+        added: List[int] = []
+
+        while True:
+            before = self.passes(self.counts, self.N)
+            if before[f]:
+                break
+            if budget is not None and budget - len(added) <= 0:
+                break
+
+            # 1) sub-strata involving the flag that still have pairs to sample
+            cands = [k for k, v in self.sub.items() if f in v["flags"] and self.pool[k]]
+            if not cands:
+                break
+
+            # 2) rank by decreasing number of red flags; 4) ties in random order
+            chosen = None
+            rejected: List[str] = []
+            fallback: List[dict] = []
+            for n_red in sorted({self.sub[k]["n_red"] for k in cands}, reverse=True):
+                tier = [k for k in cands if self.sub[k]["n_red"] == n_red]
+                self.rng.shuffle(tier)
+                for key in tier:
+                    k_need, _ = self.min_pairs(f, key)
+                    harmed = self.newly_failing(f, key, k_need, before)
+                    if not harmed:
+                        chosen = {"key": key, "k": k_need, "n_red": n_red, "tied": len(tier)}
+                        break
+                    rejected.append(f"{self.sub[key]['canonical']}|{self.sub[key]['country_risk']}"
+                                    f" (would under-sample: {','.join(harmed)})")
+                    fallback.append({"key": key, "k": k_need, "n_red": n_red, "tied": len(tier),
+                                     "n_harmed": len(harmed)})
+                if chosen:
+                    break
+
+            note = "ok"
+            if chosen is None:
+                fallback.sort(key=lambda x: (x["n_harmed"], -x["n_red"], x["k"]))
+                chosen = fallback[0]
+                note = "least harmful choice: every candidate sub-stratum under-samples another flag"
+
+            # 3) sample the pairs required (all of the sub-stratum if it is not enough)
+            key, k = chosen["key"], chosen["k"]
+            if budget is not None:
+                k = min(k, budget - len(added))
+            drawn = [self.pool[key].pop() for _ in range(k)]
+            for g in self.sub[key]["flags"]:
+                self.counts[g] += k
+            self.N += k
+            added.extend(drawn)
+
+            steps.append({
+                "round": rnd,
+                "flag": f,
+                "sub_stratum": self.sub[key]["canonical"],
+                "country_risk": self.sub[key]["country_risk"],
+                "n_red_flags": chosen["n_red"],
+                "tied_sub_strata": chosen["tied"],
+                "pairs_added": len(drawn),
+                "flag_passes_after": self._passes_one(f, self.counts[f], self.N),
+                "rejected_for_undersampling": " ; ".join(rejected),
+                "note": note,
+                "_indices": drawn,
+            })
+        return steps, added
+
+
+# ---------------------------------------------------------------------
+# 3. Check -> adjust -> check ... until every flag passes
+# ---------------------------------------------------------------------
+def run_until_pass(
+    population_path: Path,
+    sample_path: Path,
+    config_path: Path,
+    seed: int = 911,
+    max_rounds: int = 20,
+    max_add: Optional[int] = None,
+    count_country_risk: bool = False,
+) -> Tuple[pd.DataFrame, bool]:
+    cfg = rep.load_config(config_path)
+    alpha = cfg.get("alpha", 0.05)
+    small_sample = cfg.get("small_sample", 30)
+    confidence = cfg["ci"]["confidence"]
+
+    rng = random.Random(seed)
+    audit_dir = rep._ensure_audit_dir()
+    adjusted_path = audit_dir / "adjusted_sampled_pairs.csv"
+
+    # ----- load data -----------------------------------------------------
+    pop_df = pd.read_csv(population_path, dtype=str, sep=";")
+    pop_df = pop_df[pop_df["list_flags"].isna() == False].copy()
+    pop_df["canonical"] = pop_df["list_flags"].apply(rep.canonical_flags)
+
+    samp_df = pd.read_csv(sample_path, dtype=str, sep=";")
+    if "canonical" not in samp_df.columns:
+        samp_df["canonical"] = samp_df["list_flags"].apply(rep.canonical_flags)
+    if "adjustment_round" not in samp_df.columns:
+        samp_df["adjustment_round"] = 0
+
+    original_size = len(samp_df)
+    adjuster = Adjuster(pop_df, samp_df, alpha, confidence, small_sample, rng, count_country_risk)
+    pop_cnt = adjuster.pop_cnt
+
+    current_path = Path(sample_path)
+    history, log_frames, step_rows = [], [], []
+    total_added = 0
+    converged = False
+    stop_reason = ""
+    audit_df = pd.DataFrame()
+
+    # ----- loop: check, then top-up --------------------------------------
+    for rnd in range(0, max_rounds + 1):
+        print(f"\n########## Round {rnd}: checking the sample ({len(samp_df)} pairs) ##########")
+        audit_df = rep.run_representation_check(
+            population_path=population_path,
+            sample_path=current_path,
+            config_path=config_path,
+        )
+        audit_df.to_csv(audit_dir / f"representation_audit_PDQ_round{rnd}.csv", index=False)
+
+        failing = audit_df.loc[~audit_df["passed"].astype(bool), "flag"].tolist()
+        history.append({
+            "round": rnd,
+            "sample_size": len(samp_df),
+            "pairs_added_so_far": total_added,
+            "n_failing_flags": len(failing),
+            "failing_flags": ",".join(failing),
+        })
+
+        if not failing:
+            converged = True
+            break
+        if rnd == max_rounds:
+            stop_reason = f"maximum number of rounds reached ({max_rounds})"
+            break
+        if max_add is not None and max_add - total_added <= 0:
+            stop_reason = f"maximum number of added pairs reached ({max_add})"
+            break
+
+        # one failing flag at a time (rarest first); a flag fixed by the pairs
+        # added for a previous flag is skipped automatically
+        round_indices: List[int] = []
+        for f in sorted(failing, key=lambda x: pop_cnt[x]):
+            budget = None if max_add is None else max_add - total_added - len(round_indices)
+            steps, added = adjuster.fix_flag(f, rnd + 1, budget)
+            round_indices.extend(added)
+            step_rows.extend(steps)
+            for s in steps:
+                idx = s["_indices"]
+                log_frames.append(pd.DataFrame({
+                    "round": rnd + 1,
+                    "Pair_ID": pop_df.loc[idx, "Pair_ID"].values,
+                    "flags": pop_df.loc[idx, "canonical"].values,
+                    "country_risk": pop_df.loc[idx, "country_risk"].values,
+                    "n_red_flags": s["n_red_flags"],
+                    "targeted_flag": f,
+                }))
+
+        if not round_indices:
+            stop_reason = (
+                "no more pairs can be added for the failing flags "
+                "(all their population pairs are already in the sample)"
+            )
+            break
+
+        new_rows = pop_df.loc[round_indices].copy()
+        new_rows["adjustment_round"] = rnd + 1
+        samp_df = pd.concat([samp_df, new_rows], ignore_index=True)
+        total_added += len(new_rows)
+        samp_df.to_csv(adjusted_path, sep=";", index=False)
+        current_path = adjusted_path
+        print(f"\n-> {len(failing)} flag(s) failed ({', '.join(failing)}): "
+              f"added {len(new_rows)} pair(s) from the population.")
+
+    # ----- outputs -------------------------------------------------------
+    log_df = (
+        pd.concat(log_frames, ignore_index=True)
+        if log_frames
+        else pd.DataFrame(columns=["round", "Pair_ID", "flags", "country_risk", "n_red_flags", "targeted_flag"])
+    )
+    log_df.to_csv(audit_dir / "sample_adjustment_log.csv", sep=";", index=False)
+    pd.DataFrame(
+        [{k: v for k, v in s.items() if k != "_indices"} for s in step_rows]
+    ).to_csv(audit_dir / "sample_adjustment_steps.csv", sep=";", index=False)
+    pd.DataFrame(history).to_csv(audit_dir / "adjustment_history.csv", index=False)
+
+    n_flags = len(pop_cnt)
+    print("\n" + "=" * 60)
+    if converged:
+        print(f"✅ All {n_flags} flags pass.")
+    else:
+        print(f"⚠️ Stopped before all flags passed: {stop_reason}.")
+        print(f"   Still failing: {history[-1]['failing_flags']}")
+    print(f"   Sample size       : {original_size} -> {len(samp_df)} ({total_added} pair(s) added)")
+    print(f"   Rounds            : {len(history) - 1} top-up round(s)")
+    if total_added:
+        print(f"   Adjusted sample   : {adjusted_path}")
+        print(f"   Adjustment log    : {audit_dir / 'sample_adjustment_log.csv'}")
+        print(f"   Decisions         : {audit_dir / 'sample_adjustment_steps.csv'}")
+    print(f"   History           : {audit_dir / 'adjustment_history.csv'}")
+    print("=" * 60 + "\n")
+
+    return audit_df, converged
+
+
+# ---------------------------------------------------------------------
+# 4. CLI entry point
+# ---------------------------------------------------------------------
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Top-up the sample and re-check until every flag passes the representation tests."
+    )
+    parser.add_argument(
+        "--population",
+        default="pairs_for_sampling.csv",
+        help="CSV file with the full population (pairs.csv).",
+    )
+    parser.add_argument(
+        "--sample",
+        default="refactored_sampled_pairs_test1708.csv",
+        help="CSV file with the sample produced by the first pipeline (sampled_pairs.csv).",
+    )
+    parser.add_argument(
+        "--config",
+        default="US_3_sampling_config.yml",
+        help="YAML configuration file (same as used for sampling).",
+    )
+    parser.add_argument(
+        "--max-rounds",
+        type=int,
+        default=20,
+        help="Maximum number of top-up rounds (default=20).",
+    )
+    parser.add_argument(
+        "--max-add",
+        type=int,
+        default=None,
+        help="Maximum total number of pairs that may be added (default=no limit).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=911,
+        help="Random seed used for the random choices (ties, pairs) (default=911).",
+    )
+    parser.add_argument(
+        "--count-country-risk",
+        action="store_true",
+        help="Count the country-risk flag as one more red flag when ranking the sub-strata.",
+    )
+    args = parser.parse_args()
+
+    try:
+        _, converged = run_until_pass(
+            population_path=Path(args.population),
+            sample_path=Path(args.sample),
+            config_path=Path(args.config),
+            seed=args.seed,
+            max_rounds=args.max_rounds,
+            max_add=args.max_add,
+            count_country_risk=args.count_country_risk,
+        )
+    except Exception:
+        print("\n❌ An error occurred while adjusting the sample:", file=sys.stderr)
+        traceback.print_exc()
+        sys.exit(1)
+
+    sys.exit(0 if converged else 2)
+
+
+if __name__ == "__main__":
+    main()
