@@ -1,0 +1,420 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Sample adjustment, second method (stage 3.1).
+
+To be run when US_6_adjust_sample.py ends with ALL the pairs of the population in the sample
+(the sampling brought nothing: final sample size = population size). US_6_adjust_sample.py is not
+modified by this script.
+
+Logic
+-----
+1. Start again from the ORIGINAL sample (the file given to US_6, not its result).
+2. List all the flags in ascending order of the number of pairs they appear in (population).
+   THIS ORDER IS FIXED: it is never changed.
+3. Starting with the flag with the fewest pairs, pick pairs until the share of the flag in the
+   sample is greater than or equal to its share in the population (p_hat >= p_pop, the quantities
+   of the representation check). The statistical test does NOT have to pass at this step. A flag
+   that already reaches its population share is left as it is. Then move to the next flag.
+4. Pairs are picked by sub-stratum (flag combination x country_risk) containing the flag, ranked by
+   decreasing number of red flags, ties drawn randomly (as in US_6).
+5. Picking pairs of a sub-stratum must NEVER make another flag fail: a flag whose share in the sample
+   is >= its population share must still be >= after the pairs are added. If taking the pairs of a
+   sub-stratum (up to the point where the flag reaches its share, or the sub-stratum is exhausted)
+   would break this rule at any moment, NOTHING is taken from this sub-stratum: the script moves to
+   another sub-stratum. There are no partial pick-ups limited by another flag.
+6. If, for the current flag, no sub-stratum is left from which pairs can be picked without making
+   another flag fail, this flag is skipped (status "NOT reached (skipped)") and the algorithm
+   carries on with the next flag of the fixed order. A skipped flag is not processed again.
+   The algorithm ends after the last flag of the list (or when --max-add is reached).
+7. The representation check (US_5) is run on the original and on the final sample for information.
+
+The output files of US_6 are first moved to audit/US_6_all_pairs_sampled/ so nothing is overwritten.
+
+Usage
+-----
+python US_6.1_adjustment.py \
+    --population pairs.csv \
+    --sample sampled_pairs.csv \
+    --config sampling_config.yml \
+    [--max-add 1000] \
+    [--seed 911] \
+    [--count-country-risk]
+
+US_5_representation_check.py and US_6_adjust_sample.py must be in the same folder as this file.
+
+Outputs (in the `audit` folder used by US_5_representation_check.py)
+-------
+flag_order_audit.csv                every flag in the order used: population share, sample share
+                                    before / after, pairs added for it, status
+sample_adjustment_steps.csv         one row per decision (flag, sub-stratum, pairs added, shares before /
+                                    after, sub-strata rejected because they would make another flag fail,
+                                    and the stop reason)
+sample_adjustment_log.csv           one row per added pair
+combination_audit_adjustment.csv    number of pairs sampled by combination (population, initial sample,
+                                    pairs added, final sample)
+adjusted_sampled_pairs.csv          original sample + added pairs (column `adjustment_round` = 1 for added pairs)
+representation_audit_PDQ_initial.csv  representation check of the original sample
+representation_audit_PDQ.csv        representation check of the final sample
+Exit codes: 0 = every flag reaches its population share, 2 = at least one flag is not reached (skipped,
+not processed because --max-add was reached) , 1 = error.
+"""
+
+import argparse
+import importlib
+import random
+import shutil
+import sys
+import traceback
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+rep = importlib.import_module("US_5_representation_check")
+us6 = importlib.import_module("US_6_adjust_sample")   # only its helper functions are reused
+
+US6_FILES = [
+    "combination_audit_adjustment.csv",
+    "adjusted_sampled_pairs.csv",
+    "sample_adjustment_log.csv",
+    "sample_adjustment_steps.csv",
+    "adjustment_history.csv",
+    "representation_audit_PDQ*.csv",
+]
+
+
+# ---------------------------------------------------------------------
+# 1. Representation condition: share in the sample >= share in the population
+# ---------------------------------------------------------------------
+def share_reached(state: dict, f: str, counts: Dict[str, int], N: int) -> bool:
+    """samp_cnt / N >= pop_cnt / N_pop, written with integers (no rounding error)."""
+    return counts[f] * state["N_pop"] >= state["pop_cnt"][f] * N
+
+
+def flags_reached(state: dict, counts: Dict[str, int], N: int) -> Dict[str, bool]:
+    return {f: share_reached(state, f, counts, N) for f in state["flags"]}
+
+
+def pairs_to_take(state: dict, f: str, key: str, budget: Optional[int]) -> Tuple[int, int, List[str]]:
+    """
+    Pairs of sub-stratum `key` (all carry flag f) that can be taken for flag f.
+    They are counted one by one until the share of f in the sample reaches its population share,
+    or the sub-stratum has no pair left, or the budget is used.
+    If, at any moment, one more pair would make a flag that is >= its population share fall below
+    it, NOTHING is taken from this sub-stratum (0 pairs) and the flags that would fail are returned.
+    Returns (pairs to take, pairs needed or -1 if the sub-stratum is rejected, flags that would fail).
+    """
+    in_sub = state["sub"][key]["flags"]
+    counts, N = state["counts"], state["N"]
+    protected = [g for g, ok in flags_reached(state, counts, N).items() if ok]
+    available = len(state["pool"][key])
+    if budget is not None:
+        available = min(available, budget)
+
+    k = 0
+    while k < available and not share_reached(state, f, {**counts, **{g: counts[g] + k for g in in_sub}}, N + k):
+        new_counts = {g: c + ((k + 1) if g in in_sub else 0) for g, c in counts.items()}
+        harmed = [g for g in protected if not share_reached(state, g, new_counts, N + k + 1)]
+        if harmed:
+            return 0, -1, harmed          # all or nothing: another flag would be hurt -> bump to another sub-stratum
+        k += 1
+    return k, k, []
+
+
+# ---------------------------------------------------------------------
+# 2. Flag after flag, in the fixed order
+# ---------------------------------------------------------------------
+def fix_flag_share(
+    state: dict, f: str, rank: int, rng: random.Random, budget: Optional[int]
+) -> Tuple[List[dict], List[int], bool, str]:
+    """
+    Picks pairs until the flag reaches its population share.
+    Returns (decisions, index labels of the pairs added, flag reached, stop reason or "").
+    """
+    sub, pool = state["sub"], state["pool"]
+    steps: List[dict] = []
+    added: List[int] = []
+    rejected: List[str] = []
+
+    while not share_reached(state, f, state["counts"], state["N"]):
+        if budget is not None and budget - len(added) <= 0:
+            return steps, added, False, "maximum number of added pairs (--max-add) reached"
+
+        cands = [k for k, v in sub.items() if f in v["flags"] and pool[k]]
+        if not cands:
+            return steps, added, False, "no pair left in the population for this flag"
+
+        progress = False
+        for n_red in sorted({sub[k]["n_red"] for k in cands}, reverse=True):
+            tier = [k for k in cands if sub[k]["n_red"] == n_red]
+            rng.shuffle(tier)
+            for key in tier:
+                before_share = state["counts"][f] / state["N"]
+                left = None if budget is None else budget - len(added)
+                k, _, harmed = pairs_to_take(state, f, key, left)
+                label = f"{sub[key]['canonical']}|{sub[key]['country_risk']}"
+                if k == 0:
+                    if harmed:
+                        rejected.append(f"{label} (would make fail: {','.join(harmed)})")
+                    continue
+                drawn = [pool[key].pop() for _ in range(k)]
+                for g in sub[key]["flags"]:
+                    state["counts"][g] += k
+                state["N"] += k
+                added.extend(drawn)
+                progress = True
+                reached = share_reached(state, f, state["counts"], state["N"])
+                note = "ok" if reached else "sub-stratum exhausted, next sub-stratum needed"
+                steps.append({
+                    "flag_order": rank,
+                    "flag": f,
+                    "sub_stratum": sub[key]["canonical"],
+                    "country_risk": sub[key]["country_risk"],
+                    "n_red_flags": n_red,
+                    "tied_sub_strata": len(tier),
+                    "pairs_added": k,
+                    "flag_share_before_pct": round(100 * before_share, 4),
+                    "flag_share_after_pct": round(100 * state["counts"][f] / state["N"], 4),
+                    "population_share_pct": round(100 * state["pop_cnt"][f] / state["N_pop"], 4),
+                    "flag_reached": reached,
+                    "rejected_sub_strata": " ; ".join(rejected),
+                    "note": note,
+                    "_indices": drawn,
+                })
+                rejected = []
+                break                      # re-rank the sub-strata after each draw
+            if progress:
+                break
+        if not progress:
+            steps.append({
+                "flag_order": rank, "flag": f, "sub_stratum": "", "country_risk": "", "n_red_flags": "",
+                "tied_sub_strata": "", "pairs_added": 0,
+                "flag_share_before_pct": round(100 * state["counts"][f] / state["N"], 4),
+                "flag_share_after_pct": round(100 * state["counts"][f] / state["N"], 4),
+                "population_share_pct": round(100 * state["pop_cnt"][f] / state["N_pop"], 4),
+                "flag_reached": False,
+                "rejected_sub_strata": " ; ".join(rejected),
+                "note": "SKIPPED: no sub-stratum left from which pairs can be picked without making another flag fail",
+                "_indices": [],
+            })
+            return steps, added, False, (
+                "no sub-stratum left from which a pair can be picked without making another flag fail")
+    return steps, added, True, ""
+
+
+# ---------------------------------------------------------------------
+# 3. Whole run
+# ---------------------------------------------------------------------
+def run_flag_order(
+    population_path: Path,
+    sample_path: Path,
+    config_path: Path,
+    seed: int = 911,
+    max_add: Optional[int] = None,
+    count_country_risk: bool = False,
+) -> Tuple[bool, int]:
+    cfg = rep.load_config(config_path)
+    alpha = cfg.get("alpha", 0.05)
+    small_sample = cfg.get("small_sample", 30)
+    confidence = cfg["ci"]["confidence"]
+
+    rng = random.Random(seed)
+    audit_dir = rep._ensure_audit_dir()
+    adjusted_path = audit_dir / "adjusted_sampled_pairs.csv"
+
+    # ----- load data -----------------------------------------------------
+    pop_df = pd.read_csv(population_path, dtype=str, sep=";")
+    pop_df = pop_df[pop_df["list_flags"].isna() == False].copy()
+    pop_df["canonical"] = pop_df["list_flags"].apply(rep.canonical_flags)
+
+    samp_df = pd.read_csv(sample_path, dtype=str, sep=";")
+    if "canonical" not in samp_df.columns:
+        samp_df["canonical"] = samp_df["list_flags"].apply(rep.canonical_flags)
+    if "adjustment_round" not in samp_df.columns:
+        samp_df["adjustment_round"] = 0
+    initial_df = samp_df.copy()
+    original_size = len(samp_df)
+
+    # ----- representation check of the original sample (information only) ----
+    print("\n########## Representation check of the original sample ##########")
+    rep.run_representation_check(population_path=population_path, sample_path=sample_path, config_path=config_path)
+    shutil.move(str(audit_dir / "representation_audit_PDQ.csv"), str(audit_dir / "representation_audit_PDQ_initial.csv"))
+
+    state = build_state_from_us6(pop_df, samp_df, alpha, confidence, small_sample, rng, count_country_risk)
+    pop_cnt = state["pop_cnt"]
+    initial_counts = dict(state["counts"])
+    initial_N = state["N"]
+
+    # ----- fixed order: ascending number of pairs in the population ----------
+    order = sorted(state["flags"], key=lambda f: (pop_cnt[f], f))
+    print("\nOrder of the flags (fewest pairs first): " + " > ".join(f"{f} ({pop_cnt[f]})" for f in order))
+
+    step_rows, log_frames = [], []
+    status: Dict[str, str] = {}
+    pairs_for_flag: Dict[str, int] = {f: 0 for f in order}
+    total_added = 0
+    stop_reason = ""
+    skipped_reasons: List[str] = []
+    completed = True
+
+    for rank, f in enumerate(order, start=1):
+        if share_reached(state, f, state["counts"], state["N"]):
+            status[f] = "already reached when its turn came"
+            continue
+        budget = None if max_add is None else max_add - total_added
+        steps, added, reached, why = fix_flag_share(state, f, rank, rng, budget)
+        total_added += len(added)
+        pairs_for_flag[f] = len(added)
+        step_rows.extend(steps)
+        for s in steps:
+            idx = s["_indices"]
+            if idx:
+                log_frames.append(pd.DataFrame({
+                    "round": 1,
+                    "flag_order": rank,
+                    "Pair_ID": pop_df.loc[idx, "Pair_ID"].values,
+                    "flags": pop_df.loc[idx, "canonical"].values,
+                    "country_risk": pop_df.loc[idx, "country_risk"].values,
+                    "n_red_flags": s["n_red_flags"],
+                    "targeted_flag": f,
+                }))
+        if reached:
+            status[f] = "reached"
+        else:
+            completed = False
+            if why.startswith("maximum number"):
+                status[f] = "NOT reached (--max-add reached)"
+                stop_reason = f"flag '{f}' (rank {rank}): {why}; the following flags are not processed"
+                break                       # no pair can be added any more
+            status[f] = "NOT reached (skipped)"
+            skipped_reasons.append(f"'{f}' (rank {rank})")
+
+    for f in order:
+        status.setdefault(f, "not processed")
+
+    # ----- outputs -------------------------------------------------------
+    added_idx = [i for s in step_rows for i in s["_indices"]]
+    new_rows = pop_df.loc[added_idx].copy()
+    new_rows["adjustment_round"] = 1
+    final_df = pd.concat([samp_df, new_rows], ignore_index=True)
+    final_df.to_csv(adjusted_path, sep=";", index=False)
+
+    log_df = (pd.concat(log_frames, ignore_index=True) if log_frames else pd.DataFrame(
+        columns=["round", "flag_order", "Pair_ID", "flags", "country_risk", "n_red_flags", "targeted_flag"]))
+    log_df.to_csv(audit_dir / "sample_adjustment_log.csv", sep=";", index=False)
+    pd.DataFrame([{k: v for k, v in s.items() if k != "_indices"} for s in step_rows]).to_csv(
+        audit_dir / "sample_adjustment_steps.csv", sep=";", index=False)
+
+    flag_audit = pd.DataFrame([{
+        "flag_order": r,
+        "flag": f,
+        "pop_pairs": pop_cnt[f],
+        "population_share_pct": round(100 * pop_cnt[f] / state["N_pop"], 4),
+        "sample_pairs_initial": initial_counts[f],
+        "sample_share_initial_pct": round(100 * initial_counts[f] / initial_N, 4),
+        "sample_pairs_final": state["counts"][f],
+        "sample_share_final_pct": round(100 * state["counts"][f] / state["N"], 4),
+        "pairs_added_for_this_flag": pairs_for_flag[f],
+        "status": status[f],
+    } for r, f in enumerate(order, start=1)])
+    flag_audit.to_csv(audit_dir / "flag_order_audit.csv", index=False)
+
+    combo_audit = us6.build_combination_audit(pop_df, initial_df, final_df, log_df)
+    combo_audit.to_csv(audit_dir / "combination_audit_adjustment.csv", sep=";", index=False)
+    if int(combo_audit["pairs_added"].sum()) != total_added or int(combo_audit["final_sample_size"].sum()) != len(final_df):
+        raise RuntimeError("Combination audit inconsistency: totals do not match the pairs added / final sample size.")
+
+    # ----- representation check of the final sample (information only) -------
+    print("\n########## Representation check of the final sample ##########")
+    final_audit = rep.run_representation_check(
+        population_path=population_path, sample_path=adjusted_path, config_path=config_path)
+    n_pass = int(final_audit["passed"].sum())
+
+    print("\n" + "=" * 60)
+    if completed:
+        print(f"✅ Every flag reaches its share of the population ({len(order)} flags).")
+    else:
+        if skipped_reasons:
+            print("⚠️ Flag(s) skipped (no sub-stratum can supply pairs without making another flag fail): "
+                  + ", ".join(skipped_reasons) + ".")
+        if stop_reason:
+            print(f"⚠️ Stopped before the end: {stop_reason}.")
+    print(f"   Sample size        : {original_size} -> {len(final_df)} ({total_added} pair(s) added)")
+    print(f"   Representation test: {n_pass}/{len(order)} flags pass in the final sample (information only)")
+    print(f"   Flag order audit   : {audit_dir / 'flag_order_audit.csv'}")
+    print(f"   Combination audit  : {audit_dir / 'combination_audit_adjustment.csv'}")
+    print(f"   Decisions          : {audit_dir / 'sample_adjustment_steps.csv'}")
+    print(f"   Adjusted sample    : {adjusted_path}")
+    print("=" * 60 + "\n")
+    return completed, total_added
+
+
+def build_state_from_us6(pop_df, samp_df, alpha, confidence, small_sample, rng, count_country_risk) -> dict:
+    """State of the sample (counts, sub-strata, pairs left), built with the helper of US_6."""
+    return us6.build_state(pop_df, samp_df, alpha, confidence, small_sample, rng, count_country_risk)
+
+
+# ---------------------------------------------------------------------
+# 4. Move the output files of US_6 away
+# ---------------------------------------------------------------------
+def archive_us6_outputs(audit_dir: Path) -> Path:
+    """Moves the output files of US_6 into audit/US_6_all_pairs_sampled/ so they are not overwritten."""
+    target = audit_dir / "US_6_all_pairs_sampled"
+    target.mkdir(exist_ok=True)
+    moved = 0
+    for pattern in US6_FILES:
+        for f in audit_dir.glob(pattern):
+            shutil.move(str(f), str(target / f.name))
+            moved += 1
+    if moved:
+        print(f"Output files of US_6 moved to: {target}")
+    else:
+        print("No US_6 output file found in the audit folder: starting directly.")
+    return target
+
+
+# ---------------------------------------------------------------------
+# 5. CLI entry point
+# ---------------------------------------------------------------------
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Second adjustment method: flags handled from the one with the fewest pairs, "
+                    "until the share in the sample reaches the share in the population."
+    )
+    parser.add_argument("--population", default="pairs_for_sampling.csv",
+                        help="CSV file with the full population (same as US_6).")
+    parser.add_argument("--sample", default="refactored_sampled_pairs_test1708.csv",
+                        help="ORIGINAL sample (same file given to US_6, not its result).")
+    parser.add_argument("--config", default="US_3_sampling_config.yml",
+                        help="YAML configuration file (same as US_6).")
+    parser.add_argument("--max-add", type=int, default=None,
+                        help="Maximum total number of pairs that may be added (default=no limit).")
+    parser.add_argument("--seed", type=int, default=911,
+                        help="Random seed used for the random choices (default=911).")
+    parser.add_argument("--count-country-risk", action="store_true",
+                        help="Count the country-risk flag as one more red flag when ranking the sub-strata.")
+    args = parser.parse_args()
+
+    try:
+        archive_us6_outputs(rep._ensure_audit_dir())
+        completed, _ = run_flag_order(
+            population_path=Path(args.population),
+            sample_path=Path(args.sample),
+            config_path=Path(args.config),
+            seed=args.seed,
+            max_add=args.max_add,
+            count_country_risk=args.count_country_risk,
+        )
+    except Exception:
+        print("\n❌ An error occurred while adjusting the sample:", file=sys.stderr)
+        traceback.print_exc()
+        sys.exit(1)
+
+    sys.exit(0 if completed else 2)
+
+
+if __name__ == "__main__":
+    main()
